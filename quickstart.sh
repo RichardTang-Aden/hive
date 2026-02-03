@@ -17,6 +17,7 @@ USE_ASSOC_ARRAYS=false
 if [ "$BASH_MAJOR_VERSION" -ge 4 ]; then
     USE_ASSOC_ARRAYS=true
 fi
+echo "[debug] Bash version: ${BASH_VERSION}"
 
 # Colors for output
 RED='\033[0;31m'
