@@ -184,8 +184,11 @@ echo ""
 
 # Upgrade pip, setuptools, and wheel
 echo -n "  Upgrading pip... "
-$PYTHON_CMD -m pip install --upgrade pip setuptools wheel > /dev/null 2>&1
-echo -e "${GREEN}ok${NC}"
+if $PYTHON_CMD -m pip install --upgrade pip setuptools wheel > /dev/null 2>&1; then
+    echo -e "${GREEN}ok${NC}"
+else
+    echo -e "${YELLOW}skipped (pip not available, using uv)${NC}"
+fi
 
 # Install framework package from core/
 echo -n "  Installing framework... "
@@ -220,18 +223,27 @@ fi
 
 # Install MCP dependencies
 echo -n "  Installing MCP... "
-$PYTHON_CMD -m pip install mcp fastmcp > /dev/null 2>&1
-echo -e "${GREEN}ok${NC}"
+if $PYTHON_CMD -m pip install mcp fastmcp > /dev/null 2>&1; then
+    echo -e "${GREEN}ok${NC}"
+else
+    echo -e "${YELLOW}skipped${NC}"
+fi
 
 # Fix openai version compatibility
 echo -n "  Checking openai... "
-$PYTHON_CMD -m pip install "openai>=1.0.0" > /dev/null 2>&1
-echo -e "${GREEN}ok${NC}"
+if $PYTHON_CMD -m pip install "openai>=1.0.0" > /dev/null 2>&1; then
+    echo -e "${GREEN}ok${NC}"
+else
+    echo -e "${YELLOW}skipped${NC}"
+fi
 
 # Install click for CLI
 echo -n "  Installing CLI tools... "
-$PYTHON_CMD -m pip install click > /dev/null 2>&1
-echo -e "${GREEN}ok${NC}"
+if $PYTHON_CMD -m pip install click > /dev/null 2>&1; then
+    echo -e "${GREEN}ok${NC}"
+else
+    echo -e "${YELLOW}skipped${NC}"
+fi
 
 # Install Playwright browser
 echo -n "  Installing Playwright browser... "
