@@ -76,6 +76,11 @@ from .setup import (
 )
 from .template import TemplateResolver
 from .validation import ensure_credential_key_env, validate_agent_credentials
+from .agent_config import (
+    AgentCredentialConfig,
+    get_integration_id_for_agent,
+    set_integration_id_for_agent,
+)
 
 # Aden sync components (lazy import to avoid httpx dependency when not needed)
 # Usage: from core.framework.credentials.aden import AdenSyncProvider
@@ -128,6 +133,10 @@ __all__ = [
     "SetupResult",
     "detect_missing_credentials_from_nodes",
     "run_credential_setup_cli",
+    # Agent-level credential config
+    "AgentCredentialConfig",
+    "get_integration_id_for_agent",
+    "set_integration_id_for_agent",
     # Aden sync (optional - requires httpx)
     "AdenSyncProvider",
     "AdenCredentialClient",

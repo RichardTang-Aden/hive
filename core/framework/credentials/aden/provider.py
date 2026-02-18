@@ -394,11 +394,23 @@ class AdenSyncProvider(CredentialProvider):
                 name="_aden_managed",
                 value=SecretStr("true"),
             ),
+            "_provider": CredentialKey(
+                name="_provider",
+                value=SecretStr(aden_response.provider),
+            ),
+            # Legacy field for backward compatibility
             "_integration_type": CredentialKey(
                 name="_integration_type",
-                value=SecretStr(aden_response.integration_type),
+                value=SecretStr(aden_response.provider),
             ),
         }
+
+        # Store alias for display purposes
+        if aden_response.alias:
+            keys["_alias"] = CredentialKey(
+                name="_alias",
+                value=SecretStr(aden_response.alias),
+            )
 
         if aden_response.scopes:
             keys["scope"] = CredentialKey(

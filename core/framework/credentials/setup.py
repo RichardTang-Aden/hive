@@ -29,9 +29,10 @@ import getpass
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from framework.graph import NodeSpec
@@ -82,6 +83,9 @@ class MissingCredential:
 
     aden_supported: bool = False
     """Whether Aden OAuth flow is supported"""
+
+    aden_provider_name: str = ""
+    """Provider name on Aden (e.g., 'google', 'hubspot')"""
 
     direct_api_key_supported: bool = True
     """Whether direct API key entry is supported"""
@@ -137,6 +141,7 @@ class CredentialSetupSession:
         input_fn: Callable[[str], str] | None = None,
         print_fn: Callable[[str], None] | None = None,
         password_fn: Callable[[str], str] | None = None,
+        agent_path: Path | None = None,
     ):
         """
         Initialize the setup session.
@@ -146,24 +151,26 @@ class CredentialSetupSession:
             input_fn: Custom input function (default: built-in input)
             print_fn: Custom print function (default: built-in print)
             password_fn: Custom password input function (default: getpass.getpass)
+            agent_path: Path to the agent (for agent-level credential config)
         """
         self.missing = missing
         self.input_fn = input_fn or input
         self.print_fn = print_fn or print
         self.password_fn = password_fn or getpass.getpass
+        self.agent_path = agent_path
 
         # Disable colors if not a TTY
         if not sys.stdout.isatty():
             Colors.disable()
 
     @classmethod
-    def from_nodes(cls, nodes: list["NodeSpec"]) -> "CredentialSetupSession":
+    def from_nodes(cls, nodes: list[NodeSpec]) -> CredentialSetupSession:
         """Create a setup session by detecting missing credentials from nodes."""
         missing = detect_missing_credentials_from_nodes(nodes)
         return cls(missing)
 
     @classmethod
-    def from_agent_path(cls, agent_path: str | Path) -> "CredentialSetupSession":
+    def from_agent_path(cls, agent_path: str | Path) -> CredentialSetupSession:
         """Create a setup session for an agent by path."""
         agent_path = Path(agent_path)
 
@@ -180,7 +187,7 @@ class CredentialSetupSession:
             nodes = _load_nodes_from_json_agent(agent_json)
 
         missing = detect_missing_credentials_from_nodes(nodes)
-        return cls(missing)
+        return cls(missing, agent_path=agent_path)
 
     def run_interactive(self) -> SetupResult:
         """Run the interactive setup flow."""
@@ -281,7 +288,6 @@ class CredentialSetupSession:
         try:
             from aden_tools.credentials.shell_config import (
                 add_env_var_to_shell_config,
-                get_shell_config_path,
             )
 
             success, config_path = add_env_var_to_shell_config(
@@ -293,9 +299,8 @@ class CredentialSetupSession:
                 self._print(f"{Colors.GREEN}✓ Encryption key saved to {config_path}{Colors.NC}")
         except Exception:
             # Fallback: just tell the user
-            self._print(
-                f"\n{Colors.YELLOW}Add this to your shell config (~/.zshrc or ~/.bashrc):{Colors.NC}"
-            )
+            msg = "Add this to your shell config (~/.zshrc or ~/.bashrc):"
+            self._print(f"\n{Colors.YELLOW}{msg}{Colors.NC}")
             self._print(f'  export HIVE_CREDENTIAL_KEY="{key}"')
 
     def _setup_single_credential(self, cred: MissingCredential) -> bool:
@@ -408,7 +413,7 @@ class CredentialSetupSession:
         return True
 
     def _setup_via_aden(self, cred: MissingCredential) -> bool:
-        """Guide user through Aden OAuth flow."""
+        """Guide user through Aden OAuth flow with integration selection."""
         self._print(f"\n{Colors.BOLD}Aden Platform Setup{Colors.NC}")
         self._print("This will sync credentials from your Aden account.")
         self._print("")
@@ -443,33 +448,104 @@ class CredentialSetupSession:
             except Exception:
                 pass
 
-        # Sync from Aden
+        # Get the provider name to filter integrations
+        provider_name = cred.aden_provider_name or cred.credential_name
+
         try:
-            from framework.credentials import CredentialStore
+            from framework.credentials.aden import AdenClientConfig, AdenCredentialClient
 
-            store = CredentialStore.with_aden_sync(
-                base_url="https://api.adenhq.com",
-                auto_sync=True,
-            )
+            client = AdenCredentialClient(AdenClientConfig(base_url="https://api.adenhq.com"))
 
-            # Check if the credential was synced
-            cred_id = cred.credential_id or cred.credential_name
-            if store.is_available(cred_id):
-                self._print(f"{Colors.GREEN}✓ {cred.credential_name} synced from Aden{Colors.NC}")
-                # Export to current session
-                try:
-                    value = store.get_key(cred_id, cred.credential_key)
-                    if value:
-                        os.environ[cred.env_var] = value
-                except Exception:
-                    pass
-                return True
-            else:
-                self._print(
-                    f"{Colors.YELLOW}⚠ {cred.credential_name} not found in Aden account.{Colors.NC}"
-                )
-                self._print("Please connect this integration on https://hive.adenhq.com first.")
+            # List integrations and filter by provider
+            all_integrations = client.list_integrations()
+            matching = [
+                i for i in all_integrations
+                if i.provider == provider_name and i.status == "active"
+            ]
+
+            if not matching:
+                msg = f"⚠ No {provider_name} integrations found in your Aden account."
+                self._print(f"{Colors.YELLOW}{msg}{Colors.NC}")
+                self._print(f"Please connect {provider_name} on https://hive.adenhq.com first.")
                 return False
+
+            # If only one integration, use it directly
+            if len(matching) == 1:
+                selected = matching[0]
+                display = selected.alias or selected.integration_id
+                self._print(f"Using: {Colors.CYAN}{display}{Colors.NC}")
+            else:
+                # Multiple integrations - let user choose
+                self._print(f"\nSelect {provider_name} account for this agent:")
+                for i, integration in enumerate(matching, 1):
+                    display = integration.alias or integration.integration_id[:20] + "..."
+                    self._print(f"  {i}) {display}")
+
+                choice = self._input(f"\nEnter number (1-{len(matching)}): ").strip()
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(matching):
+                        selected = matching[idx]
+                    else:
+                        self._print(f"{Colors.RED}Invalid choice.{Colors.NC}")
+                        return False
+                except ValueError:
+                    self._print(f"{Colors.RED}Invalid input.{Colors.NC}")
+                    return False
+
+            # Fetch the credential
+            aden_response = client.get_credential(selected.integration_id)
+            if not aden_response:
+                self._print(f"{Colors.RED}Failed to fetch credential.{Colors.NC}")
+                return False
+
+            # Save to agent config if we have an agent path
+            if self.agent_path:
+                from framework.credentials.agent_config import AgentCredentialConfig
+
+                agent_config = AgentCredentialConfig.load(self.agent_path)
+                agent_config.set_integration_id(provider_name, selected.integration_id)
+                agent_config.save()
+                self._print(
+                    f"{Colors.GREEN}✓ Saved mapping: {provider_name} → "
+                    f"{selected.alias or selected.integration_id[:20]}{Colors.NC}"
+                )
+
+            # Store the credential locally
+            from pydantic import SecretStr
+
+            from framework.credentials import CredentialKey, CredentialObject, CredentialStore
+            from framework.credentials.models import CredentialType
+
+            store = CredentialStore.with_encrypted_storage()
+            cred_obj = CredentialObject(
+                id=selected.integration_id,
+                credential_type=CredentialType.OAUTH2,
+                keys={
+                    "access_token": CredentialKey(
+                        name="access_token",
+                        value=SecretStr(aden_response.access_token),
+                    ),
+                    "_provider": CredentialKey(
+                        name="_provider",
+                        value=SecretStr(aden_response.provider),
+                    ),
+                    "_alias": CredentialKey(
+                        name="_alias",
+                        value=SecretStr(aden_response.alias),
+                    ),
+                },
+            )
+            store.save_credential(cred_obj)
+
+            self._print(f"{Colors.GREEN}✓ {cred.credential_name} synced from Aden{Colors.NC}")
+
+            # Export to current session
+            os.environ[cred.env_var] = aden_response.access_token
+            self._print(f"{Colors.GREEN}✓ Exported to current session{Colors.NC}")
+
+            return True
+
         except Exception as e:
             self._print(f"{Colors.RED}Failed to sync from Aden: {e}{Colors.NC}")
             return False
@@ -624,6 +700,7 @@ def detect_missing_credentials_from_nodes(nodes: list) -> list[MissingCredential
                     api_key_instructions=spec.api_key_instructions,
                     tools=affected_tools,
                     aden_supported=spec.aden_supported,
+                    aden_provider_name=spec.aden_provider_name,
                     direct_api_key_supported=spec.direct_api_key_supported,
                     credential_id=spec.credential_id,
                     credential_key=spec.credential_key,
@@ -650,6 +727,7 @@ def detect_missing_credentials_from_nodes(nodes: list) -> list[MissingCredential
                     api_key_instructions=spec.api_key_instructions,
                     node_types=affected_types,
                     aden_supported=spec.aden_supported,
+                    aden_provider_name=spec.aden_provider_name,
                     direct_api_key_supported=spec.direct_api_key_supported,
                     credential_id=spec.credential_id,
                     credential_key=spec.credential_key,

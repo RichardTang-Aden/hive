@@ -313,7 +313,7 @@ class AgentRunner:
 
         Raises CredentialError with actionable guidance if any are missing.
         """
-        validate_agent_credentials(self.graph.nodes)
+        validate_agent_credentials(self.graph.nodes, agent_path=str(self.agent_path))
 
     @staticmethod
     def _import_agent_module(agent_path: Path):

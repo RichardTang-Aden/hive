@@ -77,3 +77,5 @@ core/tests/*dumps/*
 
 screenshots/*
 
+# Agent level credential config
+*.credentials.json   

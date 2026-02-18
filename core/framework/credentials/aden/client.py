@@ -119,13 +119,16 @@ class AdenCredentialResponse:
     """Response from Aden server containing credential data."""
 
     integration_id: str
-    """Unique identifier for the integration (e.g., 'hubspot')."""
+    """Unique identifier (often base64 encoded)."""
 
-    integration_type: str
-    """Type of integration (e.g., 'hubspot', 'github', 'slack')."""
+    provider: str
+    """Provider type (e.g., 'google', 'hubspot')."""
 
     access_token: str
     """The access token for API calls."""
+
+    alias: str = ""
+    """Human-readable identifier (e.g., email address)."""
 
     token_type: str = "Bearer"
     """Token type (usually 'Bearer')."""
@@ -139,6 +142,12 @@ class AdenCredentialResponse:
     metadata: dict[str, Any] = field(default_factory=dict)
     """Additional integration-specific metadata."""
 
+    # Legacy field for backward compatibility
+    @property
+    def integration_type(self) -> str:
+        """Alias for provider (backward compatibility)."""
+        return self.provider
+
     @classmethod
     def from_dict(
         cls, data: dict[str, Any], integration_id: str | None = None
@@ -149,24 +158,19 @@ class AdenCredentialResponse:
         if data.get("expires_at"):
             expires_at = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
 
-        resolved_integration_id = (
-            integration_id
-            or data.get("integration_id")
-            or data.get("alias")
-            or data.get("provider", "")
-        )
+        resolved_integration_id = integration_id or data.get("integration_id", "")
+        alias = data.get("alias", data.get("email", ""))
+        provider = data.get("provider", data.get("integration_type", ""))
 
-        resolved_integration_type = data.get("integration_type") or data.get("provider", "")
-        metadata = data.get("metadata")
-        if metadata is None and data.get("email"):
+        metadata = data.get("metadata", {})
+        if not metadata and data.get("email"):
             metadata = {"email": data.get("email")}
-        if metadata is None:
-            metadata = {}
 
         return cls(
             integration_id=resolved_integration_id,
-            integration_type=resolved_integration_type,
+            provider=provider,
             access_token=data["access_token"],
+            alias=alias,
             token_type=data.get("token_type", "Bearer"),
             expires_at=expires_at,
             scopes=data.get("scopes", []),
@@ -179,9 +183,25 @@ class AdenIntegrationInfo:
     """Information about an available integration."""
 
     integration_id: str
-    integration_type: str
-    status: str  # "active", "requires_reauth", "expired"
+    """Unique ID (often base64 encoded)."""
+
+    provider: str
+    """Provider type (e.g., 'google', 'hubspot')."""
+
+    status: str
+    """Status: 'active', 'requires_reauth', 'expired'."""
+
+    alias: str = ""
+    """Human-readable identifier (e.g., email address)."""
+
     expires_at: datetime | None = None
+    """When the token expires."""
+
+    # Legacy field for backward compatibility
+    @property
+    def integration_type(self) -> str:
+        """Alias for provider (backward compatibility)."""
+        return self.provider
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AdenIntegrationInfo:
@@ -192,8 +212,9 @@ class AdenIntegrationInfo:
 
         return cls(
             integration_id=data["integration_id"],
-            integration_type=data.get("provider", data["integration_id"]),
+            provider=data.get("provider", ""),
             status=data.get("status", "unknown"),
+            alias=data.get("alias", data.get("email", "")),
             expires_at=expires_at,
         )
 

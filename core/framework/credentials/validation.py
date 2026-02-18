@@ -49,11 +49,16 @@ class _CredentialCheck:
     help_url: str = ""
 
 
-def validate_agent_credentials(nodes: list, quiet: bool = False) -> None:
+def validate_agent_credentials(
+    nodes: list, quiet: bool = False, agent_path: str | None = None
+) -> None:
     """Check that required credentials are available before running an agent.
 
     Scans node specs for required tools and node types, then checks whether
     the corresponding credentials exist in the credential store.
+
+    For OAuth credentials (those with aden_provider_name), checks agent-level
+    config to find the mapped integration_id.
 
     Prints a summary of all credentials and their sources (encrypted store, env var).
     Raises CredentialError with actionable guidance if any are missing.
@@ -61,6 +66,7 @@ def validate_agent_credentials(nodes: list, quiet: bool = False) -> None:
     Args:
         nodes: List of NodeSpec objects from the agent graph.
         quiet: If True, suppress the credential summary output.
+        agent_path: Path to agent directory for agent-level credential config.
     """
     # Collect required tools and node types
     required_tools = {tool for node in nodes if node.tools for tool in node.tools}
@@ -70,6 +76,7 @@ def validate_agent_credentials(nodes: list, quiet: bool = False) -> None:
         from aden_tools.credentials import CREDENTIAL_SPECS
 
         from framework.credentials import CredentialStore
+        from framework.credentials.agent_config import AgentCredentialConfig
         from framework.credentials.storage import (
             CompositeStorage,
             EncryptedFileStorage,
@@ -77,6 +84,9 @@ def validate_agent_credentials(nodes: list, quiet: bool = False) -> None:
         )
     except ImportError:
         return  # aden_tools not installed, skip check
+
+    # Load agent config if available
+    agent_config = AgentCredentialConfig.load(agent_path) if agent_path else None
 
     # Build storages
     env_mapping = {
@@ -109,6 +119,13 @@ def validate_agent_credentials(nodes: list, quiet: bool = False) -> None:
     def check_credential(cred_name: str, used_by: str) -> _CredentialCheck:
         spec = CREDENTIAL_SPECS[cred_name]
         cred_id = spec.credential_id or cred_name
+
+        # For OAuth credentials, use the integration_id from agent config
+        if spec.aden_provider_name and agent_config:
+            integration_id = agent_config.get_integration_id(spec.aden_provider_name)
+            if integration_id:
+                cred_id = integration_id
+
         return _CredentialCheck(
             env_var=spec.env_var,
             source=get_source(cred_id),
