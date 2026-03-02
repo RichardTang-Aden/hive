@@ -73,7 +73,12 @@ Follow these rules for reliable, efficient browser interaction.
 
 ## Login & Auth Walls
 - If you see a "Log in" or "Sign up" prompt instead of expected
-  content, report the auth wall immediately — do NOT attempt to log in.
+  content, do NOT attempt to log in. Instead call
+  `report_to_parent(message="...", wait_for_response=true)` describing
+  what you see — the parent will relay the user's help and send you the
+  response so you can continue.
+- Use `report_to_parent(wait_for_response=true)` for any blocker you
+  cannot resolve yourself: CAPTCHAs, paywalls, 2FA prompts, etc.
 - Check for cookie consent banners and dismiss them if they block content.
 
 ## Efficiency
