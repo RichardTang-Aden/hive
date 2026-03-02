@@ -91,6 +91,10 @@ class SubagentHandle:
     result: ToolResult | None = None
     tool_use_id: str = ""
     start_time: float = field(default_factory=time.time)
+    # Activity tracking
+    last_report_message: str = ""
+    last_report_time: float = 0.0
+    report_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +513,7 @@ class EventLoopNode(NodeProtocol):
                 tools.append(delegate_tool)
                 tools.append(self._build_respond_to_subagent_tool())
                 tools.append(self._build_check_subagent_status_tool())
+                tools.append(self._build_cancel_subagent_tool())
 
         # Add report_to_parent tool for sub-agents with a report callback
         if ctx.is_subagent_mode and ctx.report_callback is not None:
@@ -545,6 +550,7 @@ class EventLoopNode(NodeProtocol):
         # 6. Main loop
         for iteration in range(start_iteration, self._config.max_iterations):
             iter_start = time.time()
+            self._subagent_status_checked = False
 
             # 6a. Check pause (no current-iteration data yet — only log_node_complete needed)
             if await self._check_pause(ctx, conversation, iteration):
@@ -575,7 +581,47 @@ class EventLoopNode(NodeProtocol):
                     conversation=conversation if _is_continuous else None,
                 )
 
-            # 6b. Drain injection queue
+            # 6b. Drain injection queue (block if waiting on subagents)
+            active_subs = [h for h in self._active_subagents.values() if h.status == "running"]
+            if active_subs and self._injection_queue.empty():
+                # Subagents are running but no events yet — block until one
+                # arrives instead of spinning the LLM in a poll loop.
+                logger.info(
+                    "[%s] iter=%d: waiting for subagent event (%d running)...",
+                    node_id, iteration, len(active_subs),
+                )
+                try:
+                    item = await asyncio.wait_for(self._injection_queue.get(), timeout=300)
+                    # Put it back so _drain_injection_queue picks it up
+                    await self._injection_queue.put(item)
+                except asyncio.TimeoutError:
+                    logger.warning("[%s] Subagent wait timed out after 300s", node_id)
+                    stalled = {}
+                    for _st_aid, _st_h in self._active_subagents.items():
+                        if _st_h.status != "running":
+                            continue
+                        _st_info: dict[str, Any] = {
+                            "task": _st_h.task[:300],
+                            "elapsed_s": round(time.time() - _st_h.start_time, 1),
+                            "report_count": _st_h.report_count,
+                        }
+                        if _st_h.last_report_message:
+                            _st_info["last_report"] = _st_h.last_report_message[:300]
+                            _st_info["last_report_age_s"] = round(time.time() - _st_h.last_report_time, 1)
+                        else:
+                            _st_info["last_report"] = None
+                            _st_info["note"] = "Sub-agent has never reported progress — may be completely stuck."
+                        stalled[_st_aid] = _st_info
+                    if stalled:
+                        await self.inject_event(json.dumps({
+                            "type": "subagent_stalled",
+                            "message": (
+                                "Sub-agent(s) have not produced any events for 5 minutes and may be stuck "
+                                "(blocked by sign-in, CAPTCHA, or in a dead loop). "
+                                "Review the details below and decide whether to cancel or wait longer."
+                            ),
+                            "agents": stalled,
+                        }))
             await self._drain_injection_queue(conversation)
 
             # 6c. Publish iteration event
@@ -1764,9 +1810,9 @@ class EventLoopNode(NodeProtocol):
                                 "message": f"Sub-agent '{_sa_agent_id}' launched asynchronously.",
                                 "status": "running",
                                 "note": (
-                                    "You will receive notifications when it completes or needs help. "
-                                    "Use respond_to_subagent if it needs help, "
-                                    "or check_subagent_status to poll progress."
+                                    "You will be automatically notified when it completes or needs help. "
+                                    "Do NOT poll or call check_subagent_status repeatedly. "
+                                    "Use respond_to_subagent only when a sub-agent asks for help."
                                 ),
                             }),
                             is_error=False,
@@ -1806,19 +1852,63 @@ class EventLoopNode(NodeProtocol):
                     results_by_id[tc.tool_use_id] = result
 
                 elif tc.tool_name == "check_subagent_status":
-                    # --- Query status of all active subagents ---
-                    _cs_status = {}
-                    for _cs_aid, _cs_h in self._active_subagents.items():
-                        _cs_status[_cs_aid] = {
-                            "status": _cs_h.status,
-                            "task": _cs_h.task[:200],
-                            "elapsed_s": round(time.time() - _cs_h.start_time, 1),
-                        }
-                    result = ToolResult(
-                        tool_use_id=tc.tool_use_id,
-                        content=json.dumps(_cs_status) if _cs_status else '{"message": "No active sub-agents."}',
-                        is_error=False,
-                    )
+                    # --- Query status of all active subagents (rate-limited: 1/iter) ---
+                    if self._subagent_status_checked:
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=(
+                                "Status already checked this turn. You will be notified automatically "
+                                "when sub-agents complete or need help. Do NOT poll — just wait."
+                            ),
+                            is_error=True,
+                        )
+                    else:
+                        self._subagent_status_checked = True
+                        _cs_status = {}
+                        for _cs_aid, _cs_h in self._active_subagents.items():
+                            _cs_status[_cs_aid] = {
+                                "status": _cs_h.status,
+                                "task": _cs_h.task[:200],
+                                "elapsed_s": round(time.time() - _cs_h.start_time, 1),
+                                "report_count": _cs_h.report_count,
+                                "last_report": _cs_h.last_report_message[:300] if _cs_h.last_report_message else None,
+                                "last_report_age_s": round(time.time() - _cs_h.last_report_time, 1) if _cs_h.last_report_time else None,
+                            }
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=json.dumps(_cs_status) if _cs_status else '{"message": "No active sub-agents."}',
+                            is_error=False,
+                        )
+                    results_by_id[tc.tool_use_id] = result
+
+                elif tc.tool_name == "cancel_subagent":
+                    # --- Cancel a running subagent ---
+                    _ca_agent_id = tc.tool_input.get("agent_id", "")
+                    _ca_reason = tc.tool_input.get("reason", "Cancelled by parent")
+                    _ca_handle = self._active_subagents.get(_ca_agent_id)
+                    if _ca_handle and _ca_handle.status == "running":
+                        _ca_handle.asyncio_task.cancel()
+                        try:
+                            await _ca_handle.asyncio_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        _ca_handle.status = "failed"
+                        _ca_handle.result = ToolResult(
+                            tool_use_id=_ca_handle.tool_use_id,
+                            content=json.dumps({"cancelled": True, "reason": _ca_reason}),
+                            is_error=True,
+                        )
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=f"Sub-agent '{_ca_agent_id}' has been cancelled: {_ca_reason}",
+                            is_error=False,
+                        )
+                    else:
+                        result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            content=f"No running sub-agent with ID '{_ca_agent_id}'.",
+                            is_error=True,
+                        )
                     results_by_id[tc.tool_use_id] = result
 
                 elif tc.tool_name == "report_to_parent":
@@ -1940,6 +2030,7 @@ class EventLoopNode(NodeProtocol):
                     "delegate_to_sub_agent",
                     "respond_to_subagent",
                     "check_subagent_status",
+                    "cancel_subagent",
                     "report_to_parent",
                 ):
                     tool_entry = {
@@ -2186,10 +2277,10 @@ class EventLoopNode(NodeProtocol):
             description=(
                 "Delegate a task asynchronously to a specialized sub-agent. "
                 "The sub-agent launches in the background — you will NOT be blocked. "
-                "Continue your work while the sub-agent runs. You will receive "
-                "notifications when the sub-agent completes or needs help. "
-                "Use respond_to_subagent if it requests assistance, and "
-                "check_subagent_status to poll progress.\n\n"
+                "Continue your work while the sub-agent runs. You will be notified "
+                "automatically when the sub-agent completes or needs help. "
+                "Use respond_to_subagent if it requests assistance. "
+                "Do NOT poll check_subagent_status in a loop.\n\n"
                 "Available sub-agents:\n" + "\n".join(agent_descriptions)
             ),
             parameters={
@@ -2220,7 +2311,11 @@ class EventLoopNode(NodeProtocol):
             description=(
                 "Send a response to a sub-agent that is waiting for help. "
                 "Use this when you receive a 'subagent_needs_help' notification "
-                "indicating a sub-agent is blocked and needs your input."
+                "indicating a sub-agent is blocked and needs your input. "
+                "IMPORTANT: Always relay the sub-agent's help request to the USER first "
+                "and send back THEIR response. Never fabricate answers or tell the "
+                "sub-agent to attempt login/authentication on its own unless"
+                "user explicitly said so"
             ),
             parameters={
                 "type": "object",
@@ -2244,11 +2339,38 @@ class EventLoopNode(NodeProtocol):
             name="check_subagent_status",
             description=(
                 "Check the status of all active sub-agents. Returns each sub-agent's "
-                "current status (running/completed/failed), task summary, and elapsed time."
+                "current status (running/completed/failed), task summary, and elapsed time. "
+                "IMPORTANT: Do NOT call this repeatedly or in a loop. You will be notified "
+                "automatically when sub-agents complete or need help. Only use this once "
+                "if you need a one-time status check."
             ),
             parameters={
                 "type": "object",
                 "properties": {},
+            },
+        )
+
+    def _build_cancel_subagent_tool(self) -> Tool:
+        """Build the synthetic cancel_subagent tool for terminating stuck subagents."""
+        return Tool(
+            name="cancel_subagent",
+            description=(
+                "Cancel a running sub-agent. Use this when a sub-agent appears stuck "
+                "or the user wants to abort it. The sub-agent's task will be terminated."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The ID of the sub-agent to cancel.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the sub-agent is being cancelled.",
+                    },
+                },
+                "required": ["agent_id"],
             },
         )
 
@@ -2387,8 +2509,8 @@ class EventLoopNode(NodeProtocol):
                 action="RETRY",
                 feedback=(
                     f"Sub-agents still running: {active_subagents}. "
-                    f"Wait for them to complete before finishing. "
-                    f"Use check_subagent_status to poll progress."
+                    f"Do NOT call check_subagent_status — you will be notified automatically "
+                    f"when they complete or need help. Just wait."
                 ),
             )
 
@@ -3643,6 +3765,11 @@ class EventLoopNode(NodeProtocol):
             wait_for_response: bool = False,
         ) -> str | None:
             subagent_reports.append({"message": message, "data": data, "timestamp": time.time()})
+            # Update handle for parent visibility (handle is created after this
+            # closure but before it's ever called, so the reference is valid).
+            handle.last_report_message = message
+            handle.last_report_time = time.time()
+            handle.report_count += 1
             if self._event_bus:
                 await self._event_bus.emit_subagent_report(
                     stream_id=ctx.node_id,

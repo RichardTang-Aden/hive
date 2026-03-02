@@ -79,6 +79,7 @@ goal = Goal(
 | tools | list[str] | [] | Tool names from MCP servers |
 | client_facing | bool | False | If True, streams to user and blocks for input |
 | nullable_output_keys | list[str] | [] | Keys that may remain unset |
+| sub_agents | list[str] | [] | Node IDs that can be invoked as subagents via delegate_to_sub_agent |
 | max_node_visits | int | 0 | 0=unlimited (default); >1 for one-shot feedback loops |
 | max_retries | int | 3 | Retries on failure |
 | success_criteria | str | "" | Natural language for judge evaluation |
